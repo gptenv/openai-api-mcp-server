@@ -60,3 +60,22 @@ npx wrangler dev
 ```
 
 The local MCP endpoint is typically `http://localhost:8787/mcp`.
+
+## Compact plugin discovery
+
+Hosts may impose a combined limit on tools across connected apps. The original
+`/mcp` and `/mcp-public` endpoints continue to list the complete catalog.
+Use `/mcp-compact` (same bearer authentication as `/mcp`) or
+`/mcp-public-compact` (same public access as `/mcp-public`) for plugin connections
+that need to stay below the host limit. Each compact endpoint advertises two tools:
+
+- `discoverOperations`: returns all operation names and summaries, filters with
+  `query`, or returns a complete input schema with `operation`.
+- `callOperation`: accepts `operation` and an `arguments` object, and dispatches
+  through the existing operation handler. Availability, upstream errors, and
+  credentials have the same behavior as the corresponding original endpoint.
+
+Discover an operation's schema before calling it. The authenticated compact
+endpoint also includes webhook tools; the public compact endpoint excludes them.
+A saved plugin connection update may require reconnecting or starting a new chat
+before the host refreshes its callable tool registry.

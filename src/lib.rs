@@ -14,6 +14,8 @@ const MCP_VERSION: &str = "2025-11-25";
 const MCP_PATH: &str = "/mcp";
 const MCP_DEMO_PATH: &str = "/mcp-demo";
 const MCP_PUBLIC_PATH: &str = "/mcp-public";
+const MCP_COMPACT_PATH: &str = "/mcp-compact";
+const MCP_PUBLIC_COMPACT_PATH: &str = "/mcp-public-compact";
 const DEMO_TOOL_NAME: &str = "mirrorCapabilities";
 const DEMO_STATUS_TOOL_NAME: &str = "demoStatus";
 const DEMO_MODELS_TOOL_NAME: &str = "listModels";
@@ -401,6 +403,80 @@ fn public_tool_list() -> Result<Vec<serde_json::Value>> {
         tool["inputSchema"] = serde_json::json!({"type":"object","additionalProperties":true});
     }
     Ok(tools)
+}
+
+fn compact_tool_list() -> Vec<serde_json::Value> {
+    vec![
+        serde_json::json!({
+            "name":"discoverOperations",
+            "description":"Discover any OpenAI API operation. With no arguments, returns all operation names and summaries. Supply operation for its complete input schema, or query to filter names and summaries. Discover the schema before calling an operation.",
+            "annotations":{"readOnlyHint":true,"openWorldHint":false},
+            "inputSchema":{"type":"object","properties":{"operation":{"type":"string"},"query":{"type":"string"}},"additionalProperties":false}
+        }),
+        serde_json::json!({
+            "name":"callOperation",
+            "description":"Call an OpenAI API operation by its exact discovered name with arguments matching its input schema. Operations can generate content, incur costs, modify or delete data; obtain the user's authorization for the selected action. Upstream availability and permissions determine success.",
+            "annotations":{"readOnlyHint":false,"destructiveHint":true,"openWorldHint":true},
+            "inputSchema":{"type":"object","properties":{"operation":{"type":"string"},"arguments":{"type":"object","additionalProperties":true}},"required":["operation","arguments"],"additionalProperties":false}
+        }),
+    ]
+}
+
+fn discover_operations(
+    tools: &[serde_json::Value],
+    arguments: &serde_json::Value,
+) -> std::result::Result<serde_json::Value, &'static str> {
+    if let Some(name) = arguments.get("operation") {
+        let name = name.as_str().ok_or("operation must be a string")?;
+        return tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .cloned()
+            .ok_or("Unknown operation");
+    }
+    let query = match arguments.get("query") {
+        Some(query) => query.as_str().ok_or("query must be a string")?,
+        None => "",
+    }
+    .to_lowercase();
+    let operations: Vec<_> = tools.iter().filter(|tool| {
+        format!("{} {}", tool["name"], tool["title"]).to_lowercase().contains(&query)
+    }).map(|tool| serde_json::json!({"name":tool["name"],"title":tool["title"],"annotations":tool["annotations"]})).collect();
+    Ok(serde_json::json!({"operations":operations,"total":tools.len()}))
+}
+
+#[cfg(test)]
+mod compact_tests {
+    use super::*;
+
+    #[test]
+    fn every_operation_is_discoverable_with_its_full_schema() {
+        let catalog = tool_list().unwrap();
+        let index = discover_operations(&catalog, &serde_json::json!({})).unwrap();
+        assert_eq!(index["operations"].as_array().unwrap().len(), 352);
+        for tool in &catalog {
+            let discovered =
+                discover_operations(&catalog, &serde_json::json!({"operation":tool["name"]}))
+                    .unwrap();
+            assert_eq!(&discovered, tool);
+        }
+        assert_eq!(compact_tool_list().len(), 2);
+    }
+
+    #[test]
+    fn discovery_filters_and_rejects_invalid_requests() {
+        let catalog = tool_list().unwrap();
+        let result =
+            discover_operations(&catalog, &serde_json::json!({"query":"listModels"})).unwrap();
+        assert_eq!(result["operations"][0]["name"], "listModels");
+        for arguments in [
+            serde_json::json!({"operation":"doesNotExist"}),
+            serde_json::json!({"operation":1}),
+            serde_json::json!({"query":true}),
+        ] {
+            assert!(discover_operations(&catalog, &arguments).is_err());
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1263,6 +1339,7 @@ async fn handle_rpc(
     env: &worker::Env,
     demo: bool,
     public: bool,
+    compact: bool,
 ) -> Result<Option<serde_json::Value>> {
     if !value.is_object() || value.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0")
     {
@@ -1300,7 +1377,9 @@ async fn handle_rpc(
             serde_json::json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"openai-api-mcp-server","version":env!("CARGO_PKG_VERSION")}})
         }
         "ping" => serde_json::json!({}),
-        "tools/list" => match if demo {
+        "tools/list" => match if compact {
+            Ok(compact_tool_list())
+        } else if demo {
             demo_tool_list()
         } else if public {
             public_tool_list()
@@ -1308,7 +1387,7 @@ async fn handle_rpc(
             tool_list()
         } {
             Ok(mut tools) => {
-                if !demo && !public {
+                if !demo && !public && !compact {
                     match webhook_tools() {
                         Ok(extra) => tools.extend(extra),
                         Err(error) => return Ok(Some(rpc_error(id, -32603, error.to_string()))),
@@ -1326,10 +1405,45 @@ async fn handle_rpc(
                     "tools/call requires a tool name",
                 )));
             };
-            let arguments = params
+            let mut arguments = params
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!({}));
+            let operation_name;
+            let name = if compact {
+                if name == "discoverOperations" {
+                    let mut catalog = tool_list()?;
+                    if !public {
+                        catalog.extend(webhook_tools()?);
+                    }
+                    let result = match discover_operations(&catalog, &arguments) {
+                        Ok(value) => {
+                            serde_json::json!({"content":[{"type":"text","text":value.to_string()}],"isError":false})
+                        }
+                        Err(error) => return Ok(Some(rpc_error(id, -32602, error))),
+                    };
+                    return Ok(Some(
+                        serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
+                    ));
+                }
+                if name != "callOperation" {
+                    return Ok(Some(rpc_error(id, -32602, format!("unknown tool: {name}"))));
+                }
+                operation_name = match arguments
+                    .get("operation")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some(name) => name.to_string(),
+                    None => return Ok(Some(rpc_error(id, -32602, "operation must be a string"))),
+                };
+                arguments = match arguments.get("arguments").filter(|value| value.is_object()) {
+                    Some(value) => value.clone(),
+                    None => return Ok(Some(rpc_error(id, -32602, "arguments must be an object"))),
+                };
+                operation_name.as_str()
+            } else {
+                name
+            };
             if demo
                 && name != DEMO_TOOL_NAME
                 && name != DEMO_STATUS_TOOL_NAME
@@ -1458,7 +1572,15 @@ pub async fn main(mut req: Request, env: worker::Env, _ctx: worker::Context) -> 
             &protocol_version,
         );
     }
-    if path != MCP_PATH && path != MCP_DEMO_PATH && path != MCP_PUBLIC_PATH {
+    if ![
+        MCP_PATH,
+        MCP_DEMO_PATH,
+        MCP_PUBLIC_PATH,
+        MCP_COMPACT_PATH,
+        MCP_PUBLIC_COMPACT_PATH,
+    ]
+    .contains(&path.as_str())
+    {
         return json_response(
             &serde_json::json!({"error":"Not found"}),
             404,
@@ -1473,7 +1595,7 @@ pub async fn main(mut req: Request, env: worker::Env, _ctx: worker::Context) -> 
             .set("Access-Control-Allow-Origin", "*")?;
         return Ok(response);
     }
-    if path == MCP_PATH {
+    if path == MCP_PATH || path == MCP_COMPACT_PATH {
         let configured_token = match env.secret("MCP_AUTH_TOKEN") {
             Ok(token) => token.to_string(),
             Err(_) => {
@@ -1529,7 +1651,15 @@ pub async fn main(mut req: Request, env: worker::Env, _ctx: worker::Context) -> 
             &protocol_version,
         );
     }
-    match handle_rpc(value, &env, path == MCP_DEMO_PATH, path == MCP_PUBLIC_PATH).await? {
+    match handle_rpc(
+        value,
+        &env,
+        path == MCP_DEMO_PATH,
+        path == MCP_PUBLIC_PATH || path == MCP_PUBLIC_COMPACT_PATH,
+        path == MCP_COMPACT_PATH || path == MCP_PUBLIC_COMPACT_PATH,
+    )
+    .await?
+    {
         Some(response) => json_response(&response, 200, &protocol_version),
         None => {
             let mut response = Response::empty()?.with_status(202);
