@@ -395,69 +395,11 @@ fn demo_tool_list() -> Result<Vec<serde_json::Value>> {
     Ok(tools)
 }
 
-fn mirror_supports(operation: &Operation) -> bool {
-    matches!(
-        (operation.method.as_str(), operation.path.as_str()),
-        ("GET", "/models") | ("POST", "/chat/completions") | ("POST", "/responses")
-    )
-}
-
 fn public_tool_list() -> Result<Vec<serde_json::Value>> {
     let mut tools = tool_list()?;
-    for (tool, operation) in tools.iter_mut().zip(operations()?) {
-        if mirror_supports(operation) {
-            tool["description"] = format!(
-                "Supported by Mirror: {} {}. Mirror implements a subset of the OpenAI request fields.",
-                operation.method, operation.path
-            )
-            .into();
-            tool["inputSchema"] = match operation.name.as_str() {
-                "listModels" => serde_json::json!({"type":"object","properties":{}}),
-                "createChatCompletion" => serde_json::json!({
-                    "type":"object",
-                    "properties":{
-                        "model":{"type":"string"},
-                        "messages":{"type":"array","items":{"type":"object","properties":{
-                            "role":{"type":"string"},"content":{}
-                        },"required":["role","content"],"additionalProperties":true}},
-                        "stream":{"type":"boolean"},
-                        "store":{"type":"boolean"},
-                        "metadata":{"type":"object"}
-                    },
-                    "required":["model","messages"],
-                    "additionalProperties":true
-                }),
-                "createResponse" => serde_json::json!({
-                    "type":"object",
-                    "properties":{
-                        "model":{"type":"string"},
-                        "input":{},
-                        "instructions":{"type":"string"},
-                        "stream":{"type":"boolean"},
-                        "store":{"type":"boolean"},
-                        "metadata":{"type":"object"}
-                    },
-                    "required":["model","input"],
-                    "additionalProperties":true
-                }),
-                _ => unreachable!(),
-            };
-        } else {
-            tool["description"] = format!(
-                "Unavailable through Mirror: {} {}. Listed for OpenAI API catalog completeness.",
-                operation.method, operation.path
-            )
-            .into();
-            tool["inputSchema"] = serde_json::json!({"type":"object","additionalProperties":true});
-        }
+    for tool in &mut tools {
+        tool["inputSchema"] = serde_json::json!({"type":"object","additionalProperties":true});
     }
-    tools.sort_by_key(|tool| {
-        let supported = matches!(
-            tool["name"].as_str(),
-            Some("listModels" | "createChatCompletion" | "createResponse")
-        );
-        !supported
-    });
     Ok(tools)
 }
 
@@ -484,32 +426,15 @@ mod demo_tests {
     }
 
     #[test]
-    fn mirror_compatibility_matches_the_three_openai_routes() {
-        let operations = operations().unwrap();
-        assert_eq!(operations.len(), 352);
-        let supported: Vec<_> = operations
-            .iter()
-            .filter(|operation| mirror_supports(operation))
-            .map(|operation| operation.name.as_str())
-            .collect();
-        assert_eq!(
-            supported,
-            ["createChatCompletion", "createResponse", "listModels"]
-        );
-    }
-
-    #[test]
     fn public_catalog_lists_all_operations_together() {
         let tools = public_tool_list().unwrap();
         assert_eq!(tools.len(), 352);
-        let first_names: Vec<_> = tools[..3]
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            first_names,
-            ["createChatCompletion", "createResponse", "listModels"]
-        );
+        assert!(tools.iter().all(|tool| {
+            !tool["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Unavailable through Mirror")
+        }));
     }
 }
 
@@ -1472,18 +1397,6 @@ async fn handle_rpc(
             else {
                 return Ok(Some(rpc_error(id, -32602, format!("unknown tool: {name}"))));
             };
-            if public && !mirror_supports(operation) {
-                let result = serde_json::json!({
-                    "content":[{"type":"text","text":format!(
-                        "Mirror does not implement {} {}. This operation is in the OpenAI API catalog but is unavailable through the configured Mirror backend.",
-                        operation.method, operation.path
-                    )}],
-                    "isError":true
-                });
-                return Ok(Some(
-                    serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}),
-                ));
-            }
             match call_openai(operation, &arguments, env).await {
                 Ok((status, body)) => {
                     let is_error = !(200..300).contains(&status);
