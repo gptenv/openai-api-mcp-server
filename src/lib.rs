@@ -18,7 +18,6 @@ const DEMO_TOOL_NAME: &str = "mirrorCapabilities";
 const DEMO_STATUS_TOOL_NAME: &str = "demoStatus";
 const DEMO_MODELS_TOOL_NAME: &str = "listModels";
 const WEBHOOK_PATH: &str = "/webhooks/openai";
-const TOOL_PAGE_SIZE: usize = 20;
 
 #[derive(Clone)]
 struct Operation {
@@ -452,53 +451,14 @@ fn public_tool_list() -> Result<Vec<serde_json::Value>> {
             tool["inputSchema"] = serde_json::json!({"type":"object","additionalProperties":true});
         }
     }
+    tools.sort_by_key(|tool| {
+        let supported = matches!(
+            tool["name"].as_str(),
+            Some("listModels" | "createChatCompletion" | "createResponse")
+        );
+        !supported
+    });
     Ok(tools)
-}
-
-fn tool_page(
-    tools: &[serde_json::Value],
-    cursor: Option<&str>,
-) -> std::result::Result<serde_json::Value, &'static str> {
-    let start = match cursor {
-        None => 0,
-        Some(value) => value
-            .strip_prefix("v1:")
-            .and_then(|offset| offset.parse::<usize>().ok())
-            .filter(|offset| *offset > 0 && *offset < tools.len() && *offset % TOOL_PAGE_SIZE == 0)
-            .ok_or("Invalid tools/list cursor")?,
-    };
-    let end = start.saturating_add(TOOL_PAGE_SIZE).min(tools.len());
-    let mut result = serde_json::json!({"tools": &tools[start..end]});
-    if end < tools.len() {
-        result["nextCursor"] = serde_json::Value::String(format!("v1:{end}"));
-    }
-    Ok(result)
-}
-
-#[cfg(test)]
-mod tool_page_tests {
-    use super::*;
-
-    #[test]
-    fn pages_cover_all_tools_without_overlap() {
-        let tools: Vec<_> = (0..45).map(|n| serde_json::json!({"name": n})).collect();
-        let first = tool_page(&tools, None).unwrap();
-        let second = tool_page(&tools, first["nextCursor"].as_str()).unwrap();
-        let third = tool_page(&tools, second["nextCursor"].as_str()).unwrap();
-        let listed: Vec<_> = [first, second, third]
-            .iter()
-            .flat_map(|page| page["tools"].as_array().unwrap().iter().cloned())
-            .collect();
-        assert_eq!(listed, tools);
-    }
-
-    #[test]
-    fn rejects_invalid_cursors() {
-        let tools = vec![serde_json::Value::Null; 45];
-        for cursor in ["0", "v1:0", "v1:1", "v1:45", "v1:999", "v2:20"] {
-            assert!(tool_page(&tools, Some(cursor)).is_err());
-        }
-    }
 }
 
 #[cfg(test)]
@@ -539,14 +499,17 @@ mod demo_tests {
     }
 
     #[test]
-    fn public_catalog_keeps_all_operations_in_small_pages() {
+    fn public_catalog_lists_all_operations_together() {
         let tools = public_tool_list().unwrap();
         assert_eq!(tools.len(), 352);
-        for offset in (0..tools.len()).step_by(TOOL_PAGE_SIZE) {
-            let cursor = (offset > 0).then(|| format!("v1:{offset}"));
-            let page = tool_page(&tools, cursor.as_deref()).unwrap();
-            assert!(serde_json::to_vec(&page).unwrap().len() < 32_000);
-        }
+        let first_names: Vec<_> = tools[..3]
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            first_names,
+            ["createChatCompletion", "createResponse", "listModels"]
+        );
     }
 }
 
@@ -1426,15 +1389,7 @@ async fn handle_rpc(
                         Err(error) => return Ok(Some(rpc_error(id, -32603, error.to_string()))),
                     }
                 }
-                let cursor = match params.get("cursor") {
-                    None => None,
-                    Some(serde_json::Value::String(value)) => Some(value.as_str()),
-                    Some(_) => return Ok(Some(rpc_error(id, -32602, "Invalid tools/list cursor"))),
-                };
-                match tool_page(&tools, cursor) {
-                    Ok(page) => page,
-                    Err(message) => return Ok(Some(rpc_error(id, -32602, message))),
-                }
+                serde_json::json!({"tools": tools})
             }
             Err(error) => return Ok(Some(rpc_error(id, -32603, error.to_string()))),
         },
