@@ -1,6 +1,10 @@
-openapi.yaml
-
-
 # Added by cargo
 
 /target
+/build
+.dev.vars
+.dev.vars.*
+.env
+.env.*
+!.env.example
+.wrangler/

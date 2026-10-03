@@ -1,0 +1,27 @@
+name = "openai-api-mcp-server"
+main = "build/index.js"
+compatibility_date = "2026-09-30"
+compatibility_flags = ["global_fetch_strictly_public"]
+
+[build]
+command = "cargo install \"worker-build@^0.8\" && \"$HOME/.cargo/bin/worker-build\" --release"
+
+[vars]
+OPENAI_API_BASE_URL = "https://mirror-worker.defcronyke.workers.dev/v1"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "openai-api-mcp-server"
+database_id = "90447d3c-eec3-4c4d-8243-5d094aa335d5"
+migrations_dir = "migrations"
+
+[[queues.producers]]
+binding = "WEBHOOK_QUEUE"
+queue = "openai-webhook-events"
+
+[[queues.consumers]]
+queue = "openai-webhook-events"
+max_batch_size = 10
+max_batch_timeout = 1
+max_retries = 5
+dead_letter_queue = "openai-webhook-events-dlq"
